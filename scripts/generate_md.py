@@ -23,13 +23,16 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LEYCHILE_XML = "https://www.leychile.cl/Consulta/obtxml"
 HEADERS = {"User-Agent": "wiki-leychile-bot/1.0 (public wiki; contact in repo)"}
 
+
 def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
+
 
 def fetch_xml(params: dict) -> bytes:
     r = requests.get(LEYCHILE_XML, params=params, headers=HEADERS, timeout=120)
     r.raise_for_status()
     return r.content
+
 
 def clean_text(s: str) -> str:
     s = s.replace("\r", "\n")
@@ -37,12 +40,15 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+
 def strip_accents(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
 
 def text_of(xpath_result) -> str:
     parts = [x.strip() for x in xpath_result if x and x.strip() and x.strip() != " "]
     return " ".join(parts).strip()
+
 
 def extract_body_excluding_metadatos(container_el) -> str:
     clone = etree.fromstring(etree.tostring(container_el))
@@ -53,8 +59,39 @@ def extract_body_excluding_metadatos(container_el) -> str:
     txt = etree.tostring(clone, method="text", encoding="unicode")
     return clean_text(txt)
 
+
+def infer_epigrafe_from_body(body: str) -> str:
+    """
+    Fallback: intenta inferir un epígrafe desde la primera línea del cuerpo.
+    Útil cuando el XML no trae TituloParte.
+    """
+    if not body:
+        return ""
+
+    first_line = body.splitlines()[0].strip()
+    if not first_line:
+        return ""
+
+    # Elimina prefijos típicos “Artículo 1°.-”, “ARTÍCULO 1°:”, etc.
+    first_line = re.sub(
+        r'^(art[ií]culo)\s+\S+\s*[\.\-–—:]*\s*',
+        '',
+        first_line,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Epígrafes demasiado largos no ayudan
+    if first_line and len(first_line) <= 120:
+        return first_line
+
+    return ""
+
+
 def find_article_nodes(root):
-    # Artículos = nodos que traen atributo tipoParte="Artículo"/"Articulo"/"Artículo transitorio", etc.
+    """
+    Artículos = nodos con atributo tipoParte="Artículo"/"Articulo"/"Artículo transitorio", etc.
+    Retorna lista de tuplas: (num_label, epigrafe, body)
+    """
     nodes = root.xpath('//*[@tipoParte]')
     arts = []
     seen = set()
@@ -66,7 +103,6 @@ def find_article_nodes(root):
         if not tp_norm.startswith("articulo"):
             continue
 
-        # Deduplicación por idParte si existe (mejor que usar id(el))
         pid = (el.get("idParte") or "").strip()
         key = pid if pid else str(id(el))
         if key in seen:
@@ -76,24 +112,26 @@ def find_article_nodes(root):
         nombre = text_of(el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="NombreParte"]//text()'))
         titulo = text_of(el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="TituloParte"]//text()'))
 
-        # Construye heading “Artículo X° …”
+        # Etiqueta corta (ideal para TOC lateral): solo número de artículo
         if nombre:
             n_norm = strip_accents(nombre).lower()
-            if n_norm.startswith("articulo"):
-                heading = nombre
-            else:
-                heading = f"Artículo {nombre}"
+            num_label = nombre if n_norm.startswith("articulo") else f"Artículo {nombre}"
         else:
-            heading = "Artículo"
-
-        if titulo and titulo.lower() not in heading.lower():
-            heading = f"{heading} — {titulo}"
+            num_label = "Artículo"
 
         body = extract_body_excluding_metadatos(el)
-        if body:
-            arts.append((heading, body))
+        if not body:
+            continue
+
+        # Epígrafe preferente: TituloParte; si no existe, se infiere desde la primera línea del cuerpo
+        epigrafe = titulo.strip() if titulo else ""
+        if not epigrafe:
+            epigrafe = infer_epigrafe_from_body(body)
+
+        arts.append((num_label, epigrafe, body))
 
     return arts
+
 
 def main():
     cfg = yaml.safe_load(NORMS_YAML.read_text(encoding="utf-8"))
@@ -144,16 +182,24 @@ def main():
             full_text = etree.tostring(root, method="text", encoding="unicode")
             lines.append(clean_text(full_text))
         else:
-            for i, (heading, _) in enumerate(articles, start=1):
+            # Índice con epígrafe (si existe)
+            for i, (num_label, epigrafe, _) in enumerate(articles, start=1):
                 anchor = f"articulo-{i:03d}"
-                lines.append(f"- [{heading}](#{anchor})")
+                if epigrafe:
+                    lines.append(f"- [{num_label} — {epigrafe}](#{anchor})")
+                else:
+                    lines.append(f"- [{num_label}](#{anchor})")
             lines.append("")
 
-            for i, (heading, body) in enumerate(articles, start=1):
+            # Secciones por artículo: TOC lateral quedará “Artículo X”, epígrafe se ve debajo
+            for i, (num_label, epigrafe, body) in enumerate(articles, start=1):
                 anchor = f"articulo-{i:03d}"
                 lines.append(f'<a id="{anchor}"></a>')
-                lines.append(f"## {heading}")
+                lines.append(f"## {num_label}")
                 lines.append("")
+                if epigrafe:
+                    lines.append(f"_{epigrafe}_")
+                    lines.append("")
                 lines.append(body)
                 lines.append("")
 
@@ -161,6 +207,7 @@ def main():
         print(f"OK: {slug} -> {len(articles)} artículos")
 
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
