@@ -3,7 +3,7 @@ normas:
     slug: ley-21719
     titulo: "Ley 21.719: Protección y tratamiento de datos personales y creación de la Agencia"
     source_url: "https://www.bcn.cl/leychile/navegar?idNorma=1209272"
-  - idNorma: 1177743
+    - idNorma: 1177743
     slug: ley-21459
     titulo: "Ley 21.459: Establece normas sobre delitos informáticos, deroga la Ley N° 19.223 y modifica otros cuerpos legales"
     source_url: "https://www.bcn.cl/leychile/navegar?idNorma=1177743"
