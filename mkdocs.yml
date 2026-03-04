@@ -10,3 +10,8 @@ markdown_extensions:
   - def_list
   - attr_list
   - tables
+nav:
+  - Inicio: index.md
+  - Normas:
+      - "Ley 21.719": normas/ley-21719.md
+      - "Ley 21.459": normas/ley-21459.md
