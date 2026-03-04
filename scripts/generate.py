@@ -2,10 +2,10 @@ import hashlib
 import pathlib
 import re
 from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
 
 import requests
 import yaml
-from lxml import etree
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NORMS_YAML = ROOT / "norms.yaml"
@@ -19,12 +19,9 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Servicio oficial descrito por LeyChile: opt=7 entrega XML de la norma
 LEYCHILE_XML = "https://www.leychile.cl/Consulta/obtxml"
 
-HEADERS = {
-    "User-Agent": "wiki-leychile-bot/1.0 (public wiki; contact in repo)",
-}
+HEADERS = {"User-Agent": "wiki-leychile-bot/1.0 (public wiki; contact in repo)"}
 
 def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
@@ -39,27 +36,24 @@ def clean_spaces(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
-def get_text_excluding_metadatos(el) -> str:
-    # Toma texto del elemento excluyendo todo lo que esté dentro de Metadatos
-    parts = el.xpath('.//text()[not(ancestor::*[local-name()="Metadatos"])]')
-    parts = [p.strip() for p in parts if p and p.strip()]
-    # separa en líneas para no quedar como “un párrafo infinito”
-    txt = "\n".join(parts)
-    txt = re.sub(r"\n{2,}", "\n", txt)
-    return txt.strip()
+def localname(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
 
-def get_articulo_title(art_el, fallback: str) -> str:
-    # Intenta leer el "NombreParte" dentro de Metadatos (suele contener “Artículo 1°”, “Artículo primero”, etc.)
-    nombre = art_el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="NombreParte"]//text()')
-    nombre = " ".join([n.strip() for n in nombre if n and n.strip()]).strip()
-    if nombre:
-        return nombre
-    # Alternativa: TituloParte
-    titulo = art_el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="TituloParte"]//text()')
-    titulo = " ".join([t.strip() for t in titulo if t and t.strip()]).strip()
-    if titulo:
-        return titulo
-    return fallback
+def element_text(el: ET.Element) -> str:
+    parts = []
+    for t in el.itertext():
+        t = (t or "").strip()
+        if t:
+            parts.append(t)
+    return "\n".join(parts).strip()
+
+def find_first_text(el: ET.Element, wanted_localname: str) -> str:
+    for child in el.iter():
+        if localname(child.tag) == wanted_localname:
+            txt = element_text(child).strip()
+            if txt:
+                return txt
+    return ""
 
 def main():
     cfg = yaml.safe_load(NORMS_YAML.read_text(encoding="utf-8"))
@@ -93,23 +87,23 @@ def main():
             print(f"Sin cambios: {slug}")
             continue
 
-        # Guarda XML raw
         raw_path.write_bytes(xml_bytes)
 
-        # Parse XML
         try:
-            root = etree.fromstring(xml_bytes)
-        except Exception as e:
+            root = ET.fromstring(xml_bytes)
+        except Exception:
             print("No pude parsear el XML. Primeros 300 bytes:")
             print(xml_bytes[:300])
-            raise
+            return 1
 
-        # Extrae artículos en orden
-        articulos = root.xpath('//*[local-name()="Articulo"]')
+        articulos = []
+        for el in root.iter():
+            if localname(el.tag) == "Articulo":
+                articulos.append(el)
 
-        lines = []
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+        lines = []
         lines.append(f"# {titulo_norma}")
         lines.append("")
         lines.append(f"Última actualización automática: {fetched}")
@@ -121,25 +115,26 @@ def main():
         lines.append("")
 
         if not articulos:
-            # Fallback: si no encuentra Articulo, vuelca texto plano
-            txt = etree.tostring(root, method="text", encoding="unicode")
-            txt = clean_spaces(txt)
-            lines.append(txt)
+            lines.append(clean_spaces(element_text(root)))
         else:
-            for i, art in enumerate(articulos, start=1):
-                art_title = get_articulo_title(art, f"Artículo {i}")
-                art_text = get_text_excluding_metadatos(art)
-                if not art_text:
+            for idx, art in enumerate(articulos, start=1):
+                nombre = find_first_text(art, "NombreParte")
+                titulo = find_first_text(art, "TituloParte")
+                heading = nombre or titulo or f"Artículo {idx}"
+
+                txt = clean_spaces(element_text(art))
+                if not txt:
                     continue
 
-                lines.append(f"## {art_title}")
+                lines.append(f"## {heading}")
                 lines.append("")
-                lines.append(art_text)
+                lines.append(txt)
                 lines.append("")
 
         md_path.write_text(clean_spaces("\n".join(lines)) + "\n", encoding="utf-8")
         hash_path.write_text(xml_hash, encoding="utf-8")
-        print(f"Actualizada: {slug} -> {md_path}")
+
+        print(f"Actualizada: {slug}")
 
     return 0
 
