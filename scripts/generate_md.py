@@ -1,6 +1,7 @@
 import hashlib
 import pathlib
 import re
+import unicodedata
 from datetime import datetime, timezone
 
 import requests
@@ -22,16 +23,13 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 LEYCHILE_XML = "https://www.leychile.cl/Consulta/obtxml"
 HEADERS = {"User-Agent": "wiki-leychile-bot/1.0 (public wiki; contact in repo)"}
 
-
 def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
-
 
 def fetch_xml(params: dict) -> bytes:
     r = requests.get(LEYCHILE_XML, params=params, headers=HEADERS, timeout=120)
     r.raise_for_status()
     return r.content
-
 
 def clean_text(s: str) -> str:
     s = s.replace("\r", "\n")
@@ -39,9 +37,14 @@ def clean_text(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+def text_of(xpath_result) -> str:
+    parts = [x.strip() for x in xpath_result if x and x.strip() and x.strip() != " "]
+    return " ".join(parts).strip()
 
 def extract_body_excluding_metadatos(container_el) -> str:
-    # Clona el contenedor y elimina Metadatos para dejar solo el texto “normativo”
     clone = etree.fromstring(etree.tostring(container_el))
     for m in clone.xpath('.//*[local-name()="Metadatos"]'):
         p = m.getparent()
@@ -50,44 +53,47 @@ def extract_body_excluding_metadatos(container_el) -> str:
     txt = etree.tostring(clone, method="text", encoding="unicode")
     return clean_text(txt)
 
-
-def find_articles_by_nombreparte(root):
-    """
-    Encuentra “artículos” buscando Metadatos/NombreParte que empiece con Artículo/Articulo,
-    y toma como contenedor el primer ancestro fuera de Metadatos.
-    """
-    nombre_nodes = root.xpath('//*[local-name()="NombreParte"]')
-
-    articles = []
+def find_article_nodes(root):
+    # Artículos = nodos que traen atributo tipoParte="Artículo"/"Articulo"/"Artículo transitorio", etc.
+    nodes = root.xpath('//*[@tipoParte]')
+    arts = []
     seen = set()
 
-    for node in nombre_nodes:
-        title = " ".join([t.strip() for t in node.xpath(".//text()") if t and t.strip()]).strip()
-        if not title:
+    for el in nodes:
+        tp = (el.get("tipoParte") or "").strip()
+        tp_norm = strip_accents(tp).lower()
+
+        if not tp_norm.startswith("articulo"):
             continue
 
-        t0 = title.lower()
-        if not (t0.startswith("artículo") or t0.startswith("articulo")):
-            continue
-
-        container = node.xpath(
-            'ancestor::*[local-name()!="Metadatos" and local-name()!="NombreParte" and local-name()!="TituloParte"][1]'
-        )
-        if not container:
-            continue
-        container = container[0]
-
-        key = id(container)
+        # Deduplicación por idParte si existe (mejor que usar id(el))
+        pid = (el.get("idParte") or "").strip()
+        key = pid if pid else str(id(el))
         if key in seen:
             continue
         seen.add(key)
 
-        body = extract_body_excluding_metadatos(container)
+        nombre = text_of(el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="NombreParte"]//text()'))
+        titulo = text_of(el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="TituloParte"]//text()'))
+
+        # Construye heading “Artículo X° …”
+        if nombre:
+            n_norm = strip_accents(nombre).lower()
+            if n_norm.startswith("articulo"):
+                heading = nombre
+            else:
+                heading = f"Artículo {nombre}"
+        else:
+            heading = "Artículo"
+
+        if titulo and titulo.lower() not in heading.lower():
+            heading = f"{heading} — {titulo}"
+
+        body = extract_body_excluding_metadatos(el)
         if body:
-            articles.append((title, body))
+            arts.append((heading, body))
 
-    return articles
-
+    return arts
 
 def main():
     cfg = yaml.safe_load(NORMS_YAML.read_text(encoding="utf-8"))
@@ -116,7 +122,7 @@ def main():
         (CACHE_DIR / f"{slug}.sha256").write_text(xml_hash, encoding="utf-8")
 
         root = etree.fromstring(xml_bytes)
-        articles = find_articles_by_nombreparte(root)
+        articles = find_article_nodes(root)
 
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -129,27 +135,24 @@ def main():
             lines.append(f"Fuente (LeyChile/BCN): {source_url}")
         lines.append(f"Identificador: {key}")
         lines.append("")
-
         lines.append("## Índice")
         lines.append("")
 
         if not articles:
-            lines.append("_No se encontraron artículos para generar secciones. Publicando texto plano._")
+            lines.append("_No se encontraron artículos (tipoParte=Artículo). Publicando texto plano._")
             lines.append("")
             full_text = etree.tostring(root, method="text", encoding="unicode")
             lines.append(clean_text(full_text))
         else:
-            # Índice con anclas estables (#articulo-001, #articulo-002, ...)
-            for i, (title, _) in enumerate(articles, start=1):
+            for i, (heading, _) in enumerate(articles, start=1):
                 anchor = f"articulo-{i:03d}"
-                lines.append(f"- [{title}](#{anchor})")
+                lines.append(f"- [{heading}](#{anchor})")
             lines.append("")
 
-            # Secciones por artículo (esto alimenta el TOC de MkDocs)
-            for i, (title, body) in enumerate(articles, start=1):
+            for i, (heading, body) in enumerate(articles, start=1):
                 anchor = f"articulo-{i:03d}"
                 lines.append(f'<a id="{anchor}"></a>')
-                lines.append(f"## {title}")
+                lines.append(f"## {heading}")
                 lines.append("")
                 lines.append(body)
                 lines.append("")
@@ -158,7 +161,6 @@ def main():
         print(f"OK: {slug} -> {len(articles)} artículos")
 
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
