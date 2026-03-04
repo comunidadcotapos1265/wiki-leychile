@@ -1,0 +1,12 @@
+site_name: "Wiki LeyChile (vigente)"
+theme:
+  name: material
+plugins:
+  - search
+markdown_extensions:
+  - toc:
+      permalink: true
+  - admonition
+  - def_list
+  - attr_list
+  - tables
