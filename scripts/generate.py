@@ -20,7 +20,6 @@ RAW_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 LEYCHILE_XML = "https://www.leychile.cl/Consulta/obtxml"
-
 HEADERS = {"User-Agent": "wiki-leychile-bot/1.0 (public wiki; contact in repo)"}
 
 def sha256(b: bytes) -> str:
@@ -96,10 +95,7 @@ def main():
             print(xml_bytes[:300])
             return 1
 
-        articulos = []
-        for el in root.iter():
-            if localname(el.tag) == "Articulo":
-                articulos.append(el)
+        articulos = [el for el in root.iter() if localname(el.tag) == "Articulo"]
 
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
