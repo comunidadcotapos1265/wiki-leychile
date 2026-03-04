@@ -33,7 +33,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Generar contenido (bajar leyes y convertir a Markdown)
-        run: python scripts/generate.py
+        run: python scripts/generate_md.py
 
       - name: Build MkDocs
         run: mkdocs build --strict --site-dir site
