@@ -1,64 +1,65 @@
 import hashlib
-import os
 import pathlib
 import re
-import sys
 from datetime import datetime, timezone
 
 import requests
 import yaml
-from bs4 import BeautifulSoup
 from lxml import etree
-from markdownify import markdownify as md
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NORMS_YAML = ROOT / "norms.yaml"
-OUT_DIR = ROOT / "docs" / "normas"
+
+DOCS_DIR = ROOT / "docs"
+OUT_DIR = DOCS_DIR / "normas"
 RAW_DIR = ROOT / "raw" / "xml"
 CACHE_DIR = ROOT / ".cache"
+
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Servicio oficial descrito por LeyChile: opt=7 entrega XML de la norma
 LEYCHILE_XML = "https://www.leychile.cl/Consulta/obtxml"
-LEYCHILE_XSL = "https://www.leychile.cl/esquemas/TestEjemploIntercambioV3.xsl"  # XSLT ejemplo oficial
 
 HEADERS = {
-    "User-Agent": "wiki-leychile-bot/1.0 (+public wiki; contact in repo)",
+    "User-Agent": "wiki-leychile-bot/1.0 (public wiki; contact in repo)",
 }
 
 def sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-def fetch_bytes(url: str, params=None) -> bytes:
-    r = requests.get(url, params=params, headers=HEADERS, timeout=90)
+def fetch_xml(params: dict) -> bytes:
+    r = requests.get(LEYCHILE_XML, params=params, headers=HEADERS, timeout=120)
     r.raise_for_status()
     return r.content
 
-def load_xslt() -> etree.XSLT:
-    xsl_path = CACHE_DIR / "TestEjemploIntercambioV3.xsl"
-    if not xsl_path.exists():
-        xsl_bytes = fetch_bytes(LEYCHILE_XSL)
-        xsl_path.write_bytes(xsl_bytes)
-    xsl_doc = etree.parse(str(xsl_path))
-    return etree.XSLT(xsl_doc)
+def clean_spaces(s: str) -> str:
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
-def html_to_markdown(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
+def get_text_excluding_metadatos(el) -> str:
+    # Toma texto del elemento excluyendo todo lo que esté dentro de Metadatos
+    parts = el.xpath('.//text()[not(ancestor::*[local-name()="Metadatos"])]')
+    parts = [p.strip() for p in parts if p and p.strip()]
+    # separa en líneas para no quedar como “un párrafo infinito”
+    txt = "\n".join(parts)
+    txt = re.sub(r"\n{2,}", "\n", txt)
+    return txt.strip()
 
-    # Quita scripts/estilos si vinieran
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-
-    # Intenta encontrar el contenido principal
-    body = soup.body or soup
-    text_html = str(body)
-
-    md_text = md(text_html, heading_style="ATX")
-
-    # Limpieza básica
-    md_text = re.sub(r"\n{3,}", "\n\n", md_text).strip()
-    return md_text
+def get_articulo_title(art_el, fallback: str) -> str:
+    # Intenta leer el "NombreParte" dentro de Metadatos (suele contener “Artículo 1°”, “Artículo primero”, etc.)
+    nombre = art_el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="NombreParte"]//text()')
+    nombre = " ".join([n.strip() for n in nombre if n and n.strip()]).strip()
+    if nombre:
+        return nombre
+    # Alternativa: TituloParte
+    titulo = art_el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="TituloParte"]//text()')
+    titulo = " ".join([t.strip() for t in titulo if t and t.strip()]).strip()
+    if titulo:
+        return titulo
+    return fallback
 
 def main():
     cfg = yaml.safe_load(NORMS_YAML.read_text(encoding="utf-8"))
@@ -67,23 +68,22 @@ def main():
         print("No hay normas en norms.yaml")
         return 1
 
-    xslt = load_xslt()
-
     for n in norms:
-        titulo = n["titulo"]
+        titulo_norma = n.get("titulo", "Norma")
         slug = n["slug"]
         source_url = n.get("source_url", "").strip()
-        params = {"opt": "7", "notaPIE": "1"}  # notaPIE documentado como opcional
+
+        params = {"opt": "7", "notaPIE": "1"}
         if "idNorma" in n:
             params["idNorma"] = str(n["idNorma"])
-            key = f"idNorma-{n['idNorma']}"
+            key = f"idNorma={n['idNorma']}"
         else:
             params["idLey"] = str(n["idLey"])
-            key = f"idLey-{n['idLey']}"
+            key = f"idLey={n['idLey']}"
 
-        xml_bytes = fetch_bytes(LEYCHILE_XML, params=params)
-
+        xml_bytes = fetch_xml(params)
         xml_hash = sha256(xml_bytes)
+
         raw_path = RAW_DIR / f"{slug}.xml"
         md_path = OUT_DIR / f"{slug}.md"
         hash_path = CACHE_DIR / f"{slug}.sha256"
@@ -93,26 +93,53 @@ def main():
             print(f"Sin cambios: {slug}")
             continue
 
+        # Guarda XML raw
         raw_path.write_bytes(xml_bytes)
 
-        xml_doc = etree.fromstring(xml_bytes)
-        html_doc = xslt(xml_doc)
-        html_str = str(html_doc)
+        # Parse XML
+        try:
+            root = etree.fromstring(xml_bytes)
+        except Exception as e:
+            print("No pude parsear el XML. Primeros 300 bytes:")
+            print(xml_bytes[:300])
+            raise
 
-        md_body = html_to_markdown(html_str)
+        # Extrae artículos en orden
+        articulos = root.xpath('//*[local-name()="Articulo"]')
 
+        lines = []
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-        header = f"# {titulo}\n\n"
-        header += f"Última actualización automática: {fetched}\n\n"
+        lines.append(f"# {titulo_norma}")
+        lines.append("")
+        lines.append(f"Última actualización automática: {fetched}")
         if source_url:
-            header += f"Fuente (LeyChile/BCN): {source_url}\n\n"
-        header += f"Identificador: {key}\n\n---\n\n"
+            lines.append(f"Fuente (LeyChile/BCN): {source_url}")
+        lines.append(f"Identificador: {key}")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
 
-        md_path.write_text(header + md_body + "\n", encoding="utf-8")
+        if not articulos:
+            # Fallback: si no encuentra Articulo, vuelca texto plano
+            txt = etree.tostring(root, method="text", encoding="unicode")
+            txt = clean_spaces(txt)
+            lines.append(txt)
+        else:
+            for i, art in enumerate(articulos, start=1):
+                art_title = get_articulo_title(art, f"Artículo {i}")
+                art_text = get_text_excluding_metadatos(art)
+                if not art_text:
+                    continue
+
+                lines.append(f"## {art_title}")
+                lines.append("")
+                lines.append(art_text)
+                lines.append("")
+
+        md_path.write_text(clean_spaces("\n".join(lines)) + "\n", encoding="utf-8")
         hash_path.write_text(xml_hash, encoding="utf-8")
-
-        print(f"Actualizada: {slug}")
+        print(f"Actualizada: {slug} -> {md_path}")
 
     return 0
 
