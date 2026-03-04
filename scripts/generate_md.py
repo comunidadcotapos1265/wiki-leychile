@@ -11,11 +11,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 NORMS_YAML = ROOT / "norms.yaml"
 
 DOCS_DIR = ROOT / "docs"
-OUT_NORMAS_DIR = DOCS_DIR / "normas"
+OUT_DIR = DOCS_DIR / "normas"
 RAW_DIR = ROOT / "raw" / "xml"
 CACHE_DIR = ROOT / ".cache"
 
-OUT_NORMAS_DIR.mkdir(parents=True, exist_ok=True)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -36,36 +36,57 @@ def fetch_xml(params: dict) -> bytes:
 def clean_text(s: str) -> str:
     s = s.replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n[ \t]+\n", "\n\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 
-def extract_article_title(art_el) -> str:
-    # Preferimos NombreParte (suele traer “Artículo 1°”, “Artículo primero”, etc.)
-    nombre = art_el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="NombreParte"]//text()')
-    nombre = " ".join([x.strip() for x in nombre if x and x.strip()]).strip()
-    if nombre:
-        return nombre
-
-    titulo = art_el.xpath('.//*[local-name()="Metadatos"]//*[local-name()="TituloParte"]//text()')
-    titulo = " ".join([x.strip() for x in titulo if x and x.strip()]).strip()
-    if titulo:
-        return titulo
-
-    return ""
-
-
-def extract_article_body(art_el) -> str:
-    # Copiamos el artículo y removemos Metadatos para que el texto quede limpio
-    art_copy = etree.fromstring(etree.tostring(art_el))
-    for m in art_copy.xpath('.//*[local-name()="Metadatos"]'):
-        parent = m.getparent()
-        if parent is not None:
-            parent.remove(m)
-
-    txt = etree.tostring(art_copy, method="text", encoding="unicode")
+def extract_body_excluding_metadatos(container_el) -> str:
+    # Clona el contenedor y elimina Metadatos para dejar solo el texto “normativo”
+    clone = etree.fromstring(etree.tostring(container_el))
+    for m in clone.xpath('.//*[local-name()="Metadatos"]'):
+        p = m.getparent()
+        if p is not None:
+            p.remove(m)
+    txt = etree.tostring(clone, method="text", encoding="unicode")
     return clean_text(txt)
+
+
+def find_articles_by_nombreparte(root):
+    """
+    Encuentra “artículos” buscando Metadatos/NombreParte que empiece con Artículo/Articulo,
+    y toma como contenedor el primer ancestro fuera de Metadatos.
+    """
+    nombre_nodes = root.xpath('//*[local-name()="NombreParte"]')
+
+    articles = []
+    seen = set()
+
+    for node in nombre_nodes:
+        title = " ".join([t.strip() for t in node.xpath(".//text()") if t and t.strip()]).strip()
+        if not title:
+            continue
+
+        t0 = title.lower()
+        if not (t0.startswith("artículo") or t0.startswith("articulo")):
+            continue
+
+        container = node.xpath(
+            'ancestor::*[local-name()!="Metadatos" and local-name()!="NombreParte" and local-name()!="TituloParte"][1]'
+        )
+        if not container:
+            continue
+        container = container[0]
+
+        key = id(container)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        body = extract_body_excluding_metadatos(container)
+        if body:
+            articles.append((title, body))
+
+    return articles
 
 
 def main():
@@ -91,77 +112,50 @@ def main():
         xml_bytes = fetch_xml(params)
         xml_hash = sha256(xml_bytes)
 
-        hash_path = CACHE_DIR / f"{slug}.sha256"
-        old_hash = hash_path.read_text(encoding="utf-8").strip() if hash_path.exists() else ""
-
-        # Guardamos XML raw (útil para auditoría)
         (RAW_DIR / f"{slug}.xml").write_bytes(xml_bytes)
+        (CACHE_DIR / f"{slug}.sha256").write_text(xml_hash, encoding="utf-8")
 
         root = etree.fromstring(xml_bytes)
-
-        articulos = root.xpath('//*[local-name()="Articulo"]')
+        articles = find_articles_by_nombreparte(root)
 
         fetched = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-        # 1) Creamos carpeta por ley para los artículos
-        law_dir = OUT_NORMAS_DIR / slug
-        law_dir.mkdir(parents=True, exist_ok=True)
-
-        # 2) Generamos cada artículo como página propia
-        index_entries = []
-        for i, art in enumerate(articulos, start=1):
-            art_title = extract_article_title(art) or f"Artículo {i}"
-            art_body = extract_article_body(art)
-            if not art_body:
-                continue
-
-            art_filename = f"articulo-{i:03d}.md"
-            art_path = law_dir / art_filename
-
-            art_page = []
-            art_page.append(f"# {titulo_norma} — {art_title}")
-            art_page.append("")
-            art_page.append(f"Última actualización automática: {fetched}")
-            if source_url:
-                art_page.append(f"Fuente (LeyChile/BCN): {source_url}")
-            art_page.append(f"Identificador: {key}")
-            art_page.append("")
-            art_page.append("---")
-            art_page.append("")
-            art_page.append(art_body)
-            art_page.append("")
-
-            art_path.write_text("\n".join(art_page), encoding="utf-8")
-
-            # Link relativo desde la página índice de la ley
-            index_entries.append((art_title, f"{slug}/{art_filename}"))
-
-        # 3) Generamos la página “corta” de la ley (Índice con links)
-        law_index_path = OUT_NORMAS_DIR / f"{slug}.md"
-        law_index = []
-        law_index.append(f"# {titulo_norma}")
-        law_index.append("")
-        law_index.append(f"Última actualización automática: {fetched}")
+        out_path = OUT_DIR / f"{slug}.md"
+        lines = []
+        lines.append(f"# {titulo_norma}")
+        lines.append("")
+        lines.append(f"Última actualización automática: {fetched}")
         if source_url:
-            law_index.append(f"Fuente (LeyChile/BCN): {source_url}")
-        law_index.append(f"Identificador: {key}")
-        law_index.append("")
-        law_index.append("## Índice")
-        law_index.append("")
+            lines.append(f"Fuente (LeyChile/BCN): {source_url}")
+        lines.append(f"Identificador: {key}")
+        lines.append("")
 
-        if not index_entries:
-            law_index.append("_No se encontraron artículos para generar páginas._")
+        lines.append("## Índice")
+        lines.append("")
+
+        if not articles:
+            lines.append("_No se encontraron artículos para generar secciones. Publicando texto plano._")
+            lines.append("")
+            full_text = etree.tostring(root, method="text", encoding="unicode")
+            lines.append(clean_text(full_text))
         else:
-            for title, rel_link in index_entries:
-                law_index.append(f"- [{title}]({rel_link})")
+            # Índice con anclas estables (#articulo-001, #articulo-002, ...)
+            for i, (title, _) in enumerate(articles, start=1):
+                anchor = f"articulo-{i:03d}"
+                lines.append(f"- [{title}](#{anchor})")
+            lines.append("")
 
-        law_index.append("")
-        law_index_path.write_text("\n".join(law_index), encoding="utf-8")
+            # Secciones por artículo (esto alimenta el TOC de MkDocs)
+            for i, (title, body) in enumerate(articles, start=1):
+                anchor = f"articulo-{i:03d}"
+                lines.append(f'<a id="{anchor}"></a>')
+                lines.append(f"## {title}")
+                lines.append("")
+                lines.append(body)
+                lines.append("")
 
-        # Cache hash (no es imprescindible, pero evita trabajo si no cambió)
-        hash_path.write_text(xml_hash, encoding="utf-8")
-
-        print(f"OK: {slug} -> índice + {len(index_entries)} artículos")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"OK: {slug} -> {len(articles)} artículos")
 
     return 0
 
